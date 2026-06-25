@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime
-from email.utils import parseaddr
+from email.utils import parsedate_to_datetime, parseaddr
 from typing import Any
 
 
 NOT_FOUND = "NOT FOUND"
+INVISIBLE_CHARS_RE = re.compile("[\u2066\u2067\u2068\u2069\u00ad\u200e\u200f\u200b]")
 
 
 SENDER_RULES: dict[str, dict[str, Any]] = {
@@ -22,6 +23,7 @@ SENDER_RULES: dict[str, dict[str, Any]] = {
         "total_patterns": [
             r"\border\s+total\s*[:\-]?\s*([$€£])\s*([0-9,]+(?:\.[0-9]{2})?)",
             r"\btotal\s*[:\-]?\s*([$€£])\s*([0-9,]+(?:\.[0-9]{2})?)",
+            r"\btotal\s*[:\-]?\s*([0-9,]+(?:\.[0-9]+)?)\s*(USD|EUR|GBP)\b",
         ],
     },
     "etsy.com": {
@@ -54,6 +56,7 @@ GENERIC_TOTAL_PATTERNS = [
     r"\border\s+total\s*[:\-]?\s*([$€£])\s*([0-9,]+(?:\.[0-9]{2})?)",
     r"\bgrand\s+total\s*[:\-]?\s*([$€£])\s*([0-9,]+(?:\.[0-9]{2})?)",
     r"\btotal\s*[:\-]?\s*([$€£])\s*([0-9,]+(?:\.[0-9]{2})?)",
+    r"\btotal\s*[:\-]?\s*([0-9,]+(?:\.[0-9]+)?)\s*(USD|EUR|GBP)\b",
     r"\bamount\s+paid\s*[:\-]?\s*([$€£])\s*([0-9,]+(?:\.[0-9]{2})?)",
 ]
 
@@ -73,6 +76,11 @@ ARRIVAL_DATE_PATTERNS = [
 ]
 
 CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP"}
+ISO_CURRENCIES = {"USD", "EUR", "GBP"}
+SPEC_TOKEN_RE = re.compile(
+    r"\d+/\d+\"?|\bm\d+(?:\.\d+)?\b|\b\d+(?:\.\d+)?(?:mm|cm|v|w|mah|a)\b|\b\d+\s*(?:pcs|pack)\b|\b\d+(?:\.\d+)+\b",
+    re.I,
+)
 UI_BUTTON_PHRASES = {
     "track package",
     "view order",
@@ -98,8 +106,12 @@ SKIP_ITEM_LINES_RE = re.compile(
 )
 
 
+def strip_invisible_chars(text: str | None) -> str:
+    return INVISIBLE_CHARS_RE.sub("", text or "")
+
+
 def normalize_body(text: str | None) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+    return re.sub(r"\s+", " ", strip_invisible_chars(text)).strip()
 
 
 def get_domain(sender_email: str | None) -> str:
@@ -152,15 +164,34 @@ def extract_total(body: str, domain: str) -> dict[str, str]:
     if not match:
         return {"total": NOT_FOUND, "currency": NOT_FOUND}
 
-    symbol = match.group(1)
-    amount = match.group(2).replace(",", "")
-    return {"total": amount, "currency": CURRENCY_SYMBOLS.get(symbol, symbol)}
+    first = match.group(1)
+    second = match.group(2)
+    if first in CURRENCY_SYMBOLS:
+        amount = second.replace(",", "")
+        currency = CURRENCY_SYMBOLS[first]
+    elif second.upper() in ISO_CURRENCIES:
+        amount = first.replace(",", "")
+        currency = second.upper()
+    else:
+        amount = second.replace(",", "")
+        currency = CURRENCY_SYMBOLS.get(first, first)
+    return {"total": amount, "currency": currency}
 
 
 def clean_item_candidate(value: str) -> str:
+    value = strip_invisible_chars(value)
     value = re.sub(r"\s+", " ", value).strip(" -:|")
     value = re.sub(r"\b(qty|quantity)\s*[:#]?\s*\d+.*$", "", value, flags=re.I).strip()
     return value
+
+
+def is_sku_only_candidate(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value or "").strip().strip(" .,!?:;-")
+    if re.fullmatch(r"item\s*(?:no|number|#)\.?\s*:?\s*\d+", normalized, re.I):
+        return True
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{2,15}", normalized, re.I) and re.search(r"\d", normalized):
+        return True
+    return False
 
 
 def is_ui_button_phrase(value: str) -> bool:
@@ -173,7 +204,7 @@ def _looks_like_item_line(line: str) -> bool:
     line = clean_item_candidate(line)
     if not line or len(line) < 3 or len(line) > 140:
         return False
-    if is_ui_button_phrase(line):
+    if is_ui_button_phrase(line) or is_sku_only_candidate(line):
         return False
     if SKIP_ITEM_LINES_RE.search(line):
         return False
@@ -191,7 +222,7 @@ def _clean_subject_item_name(raw_name: str) -> tuple[str, bool]:
 
 def _subject_item_result(raw_name: str, subject: str) -> dict[str, Any] | None:
     name, truncated = _clean_subject_item_name(raw_name)
-    if not name or is_ui_button_phrase(name):
+    if not name or is_ui_button_phrase(name) or is_sku_only_candidate(name):
         return None
     return {
         "itemName": name,
@@ -229,6 +260,18 @@ def extractAmazonItemsFromBody(body: str | None) -> list[str]:
     ]
 
 
+def extractAmazonItemBlocksFromBody(body: str | None) -> list[dict[str, Any]]:
+    normalized = normalize_body(body)
+    matches = re.findall(r"(?:^|\s)\*\s+(.+?)\s+(?:Quantity|Qty)\s*:\s*(\d+)\b", normalized, re.I)
+    blocks = []
+    for raw_name, raw_quantity in matches:
+        candidate = clean_item_candidate(raw_name)
+        if not candidate or is_ui_button_phrase(candidate) or is_sku_only_candidate(candidate):
+            continue
+        blocks.append({"item_name": candidate, "quantity": int(raw_quantity)})
+    return blocks
+
+
 def extract_item_name(body: str, domain: str) -> str:
     del domain
     normalized = normalize_body(body)
@@ -236,7 +279,7 @@ def extract_item_name(body: str, domain: str) -> str:
         match = re.search(pattern, normalized, re.I)
         if match:
             candidate = clean_item_candidate(match.group(1))
-            if candidate and not is_ui_button_phrase(candidate):
+            if candidate and not is_ui_button_phrase(candidate) and not is_sku_only_candidate(candidate):
                 return candidate
 
     lines = [line.strip() for line in (body or "").splitlines() if line.strip()]
@@ -250,18 +293,21 @@ def extract_item_name(body: str, domain: str) -> str:
 
 
 def normalizeItemName(rawName: str | None) -> dict[str, Any]:
-    value = (rawName or "").lower()
-    value = re.sub(r"\b\d+\s*pcs\b", " ", value)
-    value = re.sub(r"\b\d+\s*pack\b", " ", value)
-    value = re.sub(r"\b\d+\s*-\s*pack\b", " ", value)
-    value = re.sub(r"\bx\d+\b", " ", value)
-    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = strip_invisible_chars(rawName).lower()
+    spec_tokens = [re.sub(r"\s+", "", match.group(0)) for match in SPEC_TOKEN_RE.finditer(value)]
+    value_without_specs = SPEC_TOKEN_RE.sub(" ", value)
+    value_without_specs = re.sub(r"\bx\d+\b", " ", value_without_specs)
+    value_without_specs = re.sub(r"[^a-z0-9\s]", " ", value_without_specs)
     words = [
         word
-        for word in re.sub(r"\s+", " ", value).strip().split()
+        for word in re.sub(r"\s+", " ", value_without_specs).strip().split()
         if word and word not in MARKETING_FILLER_WORDS
     ]
-    key_words = words[:6]
+    descriptive_words = words[:6]
+    key_words = descriptive_words[:]
+    for token in spec_tokens:
+        if token and token not in key_words:
+            key_words.append(token)
     return {"cleaned": " ".join(key_words), "words": key_words}
 
 
@@ -275,6 +321,26 @@ def extract_arrival_date(body: str) -> date | None:
         if parsed:
             return parsed
     return None
+
+
+def infer_email_status(subject: str | None, body_text: str | None) -> str:
+    text = normalize_body(f"{subject or ''} {body_text or ''}")
+    if re.search(r"\bdelivered\b", text, re.I):
+        return "Delivered"
+    if re.search(r"\b(shipped|shipping|out for delivery|delivery update|delivery estimate update|on the way|tracking)\b", text, re.I):
+        return "Shipped"
+    if re.search(r"\bordered\b", text, re.I):
+        return "Ordered"
+    return "Unknown"
+
+
+def parse_email_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value).date()
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return None
 
 
 def parse_date_candidate(value: str) -> date | None:
@@ -294,14 +360,15 @@ def parse_date_candidate(value: str) -> date | None:
 def extract_order_data(email_obj: dict[str, Any]) -> dict[str, Any]:
     sender_email = email_obj.get("sender_email", "")
     sender_name = email_obj.get("sender_name", "")
-    body = email_obj.get("body_text", "")
+    subject = strip_invisible_chars(email_obj.get("subject", ""))
+    body = strip_invisible_chars(email_obj.get("body_text", ""))
     domain = get_domain(sender_email)
 
     order_number = extract_order_number(body, domain)
     total_data = extract_total(body, domain)
     amazon_body_items = extractAmazonItemsFromBody(body) if domain == "amazon.com" else []
     subject_item = (
-        extractItemNameFromSubject(email_obj.get("subject", ""))
+        extractItemNameFromSubject(subject)
         if domain == "amazon.com" and not amazon_body_items
         else None
     )
@@ -324,7 +391,13 @@ def extract_order_data(email_obj: dict[str, Any]) -> dict[str, Any]:
         multiple_items = bool(re.search(r"\b(\d+)\s+(items|products)\b", normalize_body(body), re.I))
         item_name_source = "not_found" if item_name == NOT_FOUND else "body"
     normalized_item = normalizeItemName(item_name if item_name != NOT_FOUND else "")
-    arrival_date = extract_arrival_date(body)
+    status = infer_email_status(subject, body)
+    if status == "Delivered":
+        arrival_date = parse_email_date(email_obj.get("date", ""))
+        arrival_date_source = "delivered_email" if arrival_date else NOT_FOUND
+    else:
+        arrival_date = extract_arrival_date(body)
+        arrival_date_source = "parsed_estimate" if arrival_date else NOT_FOUND
 
     hits = [
         order_number != NOT_FOUND,
@@ -347,6 +420,7 @@ def extract_order_data(email_obj: dict[str, Any]) -> dict[str, Any]:
         "itemNameWords": normalized_item["words"],
         "multipleItems": multiple_items,
         "arrivalDate": arrival_date.isoformat() if arrival_date else NOT_FOUND,
+        "arrivalDateSource": arrival_date_source,
         "confidence": confidence,
         "needsReview": confidence < 0.75,
     }

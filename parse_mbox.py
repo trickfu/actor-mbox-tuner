@@ -15,11 +15,19 @@ from pathlib import Path
 from typing import Iterable
 
 
-ORDER_SUBJECT_RE = re.compile(r"\b(order|receipt|confirmation|shipped|shipping)\b", re.I)
+ORDER_SUBJECT_RE = re.compile(
+    r"\b(order|receipt|confirmation|shipped|shipping|delivered|delivery|arriving)\b",
+    re.I,
+)
 EXCLUDE_SUBJECT_RE = re.compile(
     r"\b(unsubscribe|subscription|email preferences|mailing list|newsletter)\b",
     re.I,
 )
+INVISIBLE_CHARS_RE = re.compile("[\u2066\u2067\u2068\u2069\u00ad\u200e\u200f\u200b]")
+
+
+def strip_invisible_chars(text: str | None) -> str:
+    return INVISIBLE_CHARS_RE.sub("", text or "")
 
 
 def decode_header_value(value: str | None) -> str:
@@ -52,7 +60,7 @@ def html_to_text(value: str) -> str:
     value = html.unescape(value)
     value = re.sub(r"[ \t\r\f\v]+", " ", value)
     value = re.sub(r"\n\s+", "\n", value)
-    return value.strip()
+    return strip_invisible_chars(value.strip())
 
 
 def iter_body_parts(message: Message) -> Iterable[Message]:
@@ -97,9 +105,9 @@ def parse_message(message: Message) -> dict[str, str]:
         "message_id": decode_header_value(message.get("Message-ID")),
         "sender_email": sender_email,
         "sender_name": sender_name,
-        "subject": decode_header_value(message.get("Subject")),
+        "subject": strip_invisible_chars(decode_header_value(message.get("Subject"))),
         "date": decode_header_value(message.get("Date")),
-        "body_text": extract_body_text(message),
+        "body_text": strip_invisible_chars(extract_body_text(message)),
     }
 
 

@@ -27,9 +27,24 @@ CSV_FIELDS = [
     "item_name_normalized",
     "item_name_truncated",
     "arrival_date",
+    "arrival_date_source",
     "confidence",
     "needs_review",
 ]
+AMAZON_LINE_ITEM_CSV_FIELDS = [
+    "order_number",
+    "item_name_normalized",
+    "quantity",
+    "current_status",
+    "ordered_date",
+    "shipped_date",
+    "delivered_date",
+    "added_to_inventory",
+    "num_contributing_emails",
+]
+AMAZON_LINE_ITEM_STATE_PATH = "amazon_line_items.json"
+AMAZON_LINE_ITEM_CSV_PATH = "amazon_line_items.csv"
+VERIFICATION_ORDER_NUMBER = "114-2441697-7949852"
 
 FOOD_SENDERS = {
     "doordash.com",
@@ -53,7 +68,7 @@ SHIPPING_STATUS_RE = re.compile(
     r"\b(ordered|shipped|shipping|delivered|out for delivery|delivery update|delivery estimate update|arriv(?:e|es|ing)|on the way|tracking)\b",
     re.I,
 )
-STATUS_RANK = {"Unknown": 0, "Ordered": 1, "Shipped": 2, "Delivered": 3}
+STATUS_RANK = {"Unknown": 0, "Ordered": 1, "Shipped": 2, "Out for delivery": 3, "Delivered": 4}
 LAST_CATEGORY_COUNTS: Counter[str] = Counter()
 LAST_RAW_INVENTORY_COUNT = 0
 
@@ -83,9 +98,10 @@ def classifyEmailCategory(
 ) -> str:
     host = sender_host(senderEmail)
     domain = extract.get_domain(senderEmail)
-    sender_name = senderName or ""
-    subject_text = subject or ""
-    combined = f"{subject_text} {bodyText or ''}"
+    sender_name = extract.strip_invisible_chars(senderName)
+    subject_text = extract.strip_invisible_chars(subject)
+    body_text = extract.strip_invisible_chars(bodyText)
+    combined = f"{subject_text} {body_text}"
 
     if host in FOOD_SENDERS or domain in FOOD_SENDERS or FOOD_SENDER_NAME_RE.search(sender_name):
         return "food"
@@ -99,14 +115,234 @@ def classifyEmailCategory(
 
 
 def infer_status(subject: str | None, body_text: str | None) -> str:
-    text = f"{subject or ''} {body_text or ''}"
-    if re.search(r"\bdelivered\b", text, re.I):
+    return extract.infer_email_status(subject, body_text)
+
+
+def amazon_line_item_status(subject: str | None) -> str | None:
+    subject_text = extract.normalize_body(subject)
+    if re.match(r"^delivered\b", subject_text, re.I):
         return "Delivered"
-    if re.search(r"\b(shipped|shipping|out for delivery|delivery update|delivery estimate update|on the way|tracking)\b", text, re.I):
+    if re.match(r"^out\s+for\s+delivery\b", subject_text, re.I):
+        return "Out for delivery"
+    if re.match(r"^shipped\b", subject_text, re.I):
         return "Shipped"
-    if re.search(r"\bordered\b", text, re.I):
+    if re.search(r"\byour amazon\.com order of .+ has shipped\b", subject_text, re.I):
+        return "Shipped"
+    if re.match(r"^ordered\b", subject_text, re.I):
         return "Ordered"
-    return "Unknown"
+    if re.search(r"\byour amazon\.com order of\b", subject_text, re.I):
+        return "Ordered"
+    return None
+
+
+def amazon_line_item_flags(subject: str | None) -> dict[str, bool]:
+    subject_text = extract.normalize_body(subject)
+    return {
+        "payment_declined": bool(re.search(r"\bpayment declined\b", subject_text, re.I)),
+        "shipping_delayed": bool(re.search(r"\bdelay in shipping\b", subject_text, re.I)),
+    }
+
+
+def line_item_key(order_number: str, normalized_item_name: str) -> str:
+    return f"{order_number}::{normalized_item_name}"
+
+
+def matching_line_item_key(
+    state: dict[str, dict[str, Any]],
+    order_number: str,
+    normalized_item_name: str,
+) -> str:
+    new_tokens = set(normalized_item_name.split())
+    if len(new_tokens) < 2:
+        return line_item_key(order_number, normalized_item_name)
+
+    for existing_key, record in list(state.items()):
+        if record.get("order_number") != order_number:
+            continue
+        existing_normalized = record.get("item_name_normalized", "")
+        existing_tokens = set(existing_normalized.split())
+        if len(existing_tokens) < 2:
+            continue
+        if existing_tokens <= new_tokens or new_tokens <= existing_tokens:
+            if len(new_tokens) > len(existing_tokens):
+                new_key = line_item_key(order_number, normalized_item_name)
+                state[new_key] = state.pop(existing_key)
+                state[new_key]["item_name_normalized"] = normalized_item_name
+                return new_key
+            return existing_key
+
+    return line_item_key(order_number, normalized_item_name)
+
+
+def default_line_item_record(
+    order_number: str,
+    item_name_raw: str,
+    item_name_normalized: str,
+    quantity: int,
+) -> dict[str, Any]:
+    return {
+        "order_number": order_number,
+        "item_name_raw": item_name_raw,
+        "item_name_normalized": item_name_normalized,
+        "quantity": quantity,
+        "current_status": "Unknown",
+        "ordered_date": "",
+        "shipped_date": "",
+        "delivered_date": "",
+        "last_seen_email_date": "",
+        "contributing_message_ids": [],
+        "added_to_inventory": False,
+        "payment_declined": False,
+        "shipping_delayed": False,
+    }
+
+
+def advance_line_item_status(record: dict[str, Any], status: str | None, email_date: str) -> None:
+    if not status:
+        return
+    current_rank = STATUS_RANK.get(record.get("current_status", "Unknown"), 0)
+    next_rank = STATUS_RANK[status]
+    if next_rank > current_rank:
+        record["current_status"] = status
+
+    if status == "Ordered" and not record.get("ordered_date"):
+        record["ordered_date"] = email_date
+    elif status == "Shipped" and not record.get("shipped_date"):
+        record["shipped_date"] = email_date
+    elif status == "Out for delivery" and not record.get("shipped_date"):
+        record["shipped_date"] = email_date
+    elif status == "Delivered" and not record.get("delivered_date"):
+        record["delivered_date"] = email_date
+
+    if record["current_status"] == "Delivered" and not record.get("added_to_inventory"):
+        record["added_to_inventory"] = True
+
+
+def max_iso_date(left: str, right: str) -> str:
+    if not left:
+        return right
+    if not right:
+        return left
+    return max(left, right)
+
+
+def update_amazon_line_item_state(
+    emails: list[dict[str, Any]],
+    existing_state: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    state = {key: dict(value) for key, value in (existing_state or {}).items()}
+    for email_obj in emails:
+        if extract.get_domain(email_obj.get("sender_email", "")) != "amazon.com":
+            continue
+        body = email_obj.get("body_text", "")
+        order_number = extract.extract_order_number(body, "amazon.com")
+        if not is_hit(order_number):
+            order_number = extract.extract_order_number(
+                f"{email_obj.get('subject', '')} {body}",
+                "amazon.com",
+            )
+        if not is_hit(order_number):
+            continue
+
+        item_blocks = extract.extractAmazonItemBlocksFromBody(body)
+        if not item_blocks:
+            subject_item = extract.extractItemNameFromSubject(email_obj.get("subject", ""))
+            if subject_item:
+                item_blocks = [{"item_name": subject_item["itemName"], "quantity": 1}]
+        flags = amazon_line_item_flags(email_obj.get("subject", ""))
+        status = amazon_line_item_status(email_obj.get("subject", ""))
+        parsed_email_date = extract.parse_email_date(email_obj.get("date", ""))
+        email_date = parsed_email_date.isoformat() if parsed_email_date else ""
+        message_id = email_obj.get("message_id") or email_obj.get("messageId") or ""
+
+        if not item_blocks and any(flags.values()):
+            for record in state.values():
+                if record.get("order_number") == order_number:
+                    record["payment_declined"] = record.get("payment_declined", False) or flags["payment_declined"]
+                    record["shipping_delayed"] = record.get("shipping_delayed", False) or flags["shipping_delayed"]
+                    record["last_seen_email_date"] = max_iso_date(record.get("last_seen_email_date", ""), email_date)
+                    if message_id and message_id not in record["contributing_message_ids"]:
+                        record["contributing_message_ids"].append(message_id)
+            continue
+
+        for item_block in item_blocks:
+            normalized = extract.normalizeItemName(item_block["item_name"])["cleaned"]
+            if not normalized:
+                continue
+            key = matching_line_item_key(state, order_number, normalized)
+            record = state.setdefault(
+                key,
+                default_line_item_record(
+                    order_number,
+                    item_block["item_name"],
+                    normalized,
+                    item_block["quantity"],
+                ),
+            )
+            if len(item_block["item_name"]) > len(record.get("item_name_raw", "")):
+                record["item_name_raw"] = item_block["item_name"]
+            record["quantity"] = max(int(record.get("quantity", 0)), item_block["quantity"])
+            record["payment_declined"] = record.get("payment_declined", False) or flags["payment_declined"]
+            record["shipping_delayed"] = record.get("shipping_delayed", False) or flags["shipping_delayed"]
+            record["last_seen_email_date"] = max_iso_date(record.get("last_seen_email_date", ""), email_date)
+            if message_id and message_id not in record["contributing_message_ids"]:
+                record["contributing_message_ids"].append(message_id)
+            advance_line_item_status(record, status, email_date)
+    return state
+
+
+def amazon_line_item_rows(state: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for record in state.values():
+        rows.append(
+            {
+                **record,
+                "num_contributing_emails": len(record.get("contributing_message_ids", [])),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["order_number"], row["item_name_normalized"]))
+
+
+def write_amazon_line_items_csv(rows: list[dict[str, Any]], csv_path: str | Path) -> None:
+    with Path(csv_path).open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=AMAZON_LINE_ITEM_CSV_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row[field] for field in AMAZON_LINE_ITEM_CSV_FIELDS})
+
+
+def load_amazon_line_item_state(path: str | Path = AMAZON_LINE_ITEM_STATE_PATH) -> dict[str, dict[str, Any]]:
+    state_path = Path(path)
+    if not state_path.exists():
+        return {}
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def write_amazon_line_item_state(
+    state: dict[str, dict[str, Any]],
+    path: str | Path = AMAZON_LINE_ITEM_STATE_PATH,
+) -> None:
+    Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def print_amazon_order_breakdown(rows: list[dict[str, Any]], order_number: str = VERIFICATION_ORDER_NUMBER) -> None:
+    order_rows = [row for row in rows if row["order_number"] == order_number]
+    print()
+    print(f"Amazon line items for order {order_number}:")
+    if not order_rows:
+        print("No line items found.")
+        return
+    print(
+        "order_number | item_name_normalized | quantity | current_status | "
+        "ordered_date | shipped_date | delivered_date | added_to_inventory | num_contributing_emails"
+    )
+    print("--- | --- | ---: | --- | --- | --- | --- | --- | ---:")
+    for row in order_rows:
+        print(
+            f"{row['order_number']} | {row['item_name_normalized']} | {row['quantity']} | "
+            f"{row['current_status']} | {row['ordered_date']} | {row['shipped_date']} | "
+            f"{row['delivered_date']} | {row['added_to_inventory']} | {row['num_contributing_emails']}"
+        )
 
 
 def build_result_row(email_obj: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +365,7 @@ def build_result_row(email_obj: dict[str, Any]) -> dict[str, Any]:
         "item_name_truncated": data["itemNameTruncated"],
         "item_name_words": data["itemNameWords"],
         "arrival_date": data["arrivalDate"],
+        "arrival_date_source": data["arrivalDateSource"],
         "confidence": data["confidence"],
         "needs_review": data["needsReview"],
         "_body_text": email_obj.get("body_text", ""),
@@ -200,6 +437,7 @@ def merge_order_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
     canonical["multiple_items"] = len(canonical["items"]) > 1
     canonical["total"] = total_source["total"]
     canonical["arrival_date"] = arrival_source["arrival_date"]
+    canonical["arrival_date_source"] = arrival_source["arrival_date_source"]
     canonical["status"] = latest_status_row["status"]
     canonical["subject"] = item_source["subject"]
     canonical["message_ids"] = ", ".join(
@@ -340,6 +578,8 @@ def analyze_file(
     parsed_path: str | Path = "parsed_emails.json",
     csv_path: str | Path = "extraction_results.csv",
     print_report: bool = True,
+    amazon_state_path: str | Path = AMAZON_LINE_ITEM_STATE_PATH,
+    amazon_line_items_csv_path: str | Path = AMAZON_LINE_ITEM_CSV_PATH,
 ) -> list[dict[str, Any]]:
     emails = json.loads(Path(parsed_path).read_text(encoding="utf-8"))
     global LAST_CATEGORY_COUNTS, LAST_RAW_INVENTORY_COUNT
@@ -359,6 +599,13 @@ def analyze_file(
     LAST_RAW_INVENTORY_COUNT = len(inventory_emails)
     raw_rows = [build_result_row(email_obj) for email_obj in inventory_emails]
     rows = collapse_duplicate_orders(raw_rows)
+    amazon_state = update_amazon_line_item_state(
+        inventory_emails,
+        load_amazon_line_item_state(amazon_state_path),
+    )
+    amazon_rows = amazon_line_item_rows(amazon_state)
+    write_amazon_line_item_state(amazon_state, amazon_state_path)
+    write_amazon_line_items_csv(amazon_rows, amazon_line_items_csv_path)
     write_csv(rows, csv_path)
     if print_report:
         print("Category counts:")
@@ -368,6 +615,9 @@ def analyze_file(
         print(f"Inventory distinct purchases written: {len(rows)}")
         print()
         print_summary(rows)
+        print()
+        print(f"Wrote {len(amazon_rows)} Amazon line items to {amazon_line_items_csv_path}")
+        print_amazon_order_breakdown(amazon_rows)
         print()
         print(f"Wrote {len(rows)} rows to {csv_path}")
     return rows

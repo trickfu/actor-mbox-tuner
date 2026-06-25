@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local test data
+testmail.mbox
+
+# Generated outputs
+amazon_line_items.csv
+amazon_line_items.json
+extraction_results.csv
+parsed_emails.json
