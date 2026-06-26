@@ -16,6 +16,7 @@ class ParseMboxTests(unittest.TestCase):
     def test_order_filter_includes_order_subjects_and_excludes_unsubscribe(self):
         self.assertTrue(parse_mbox.looks_like_order_email("Your order has shipped"))
         self.assertTrue(parse_mbox.looks_like_order_email("Receipt for your purchase"))
+        self.assertTrue(parse_mbox.looks_like_order_email('Ordered: 5 "USBGear 10-Port USB Hub..." and 34 more items'))
         self.assertTrue(parse_mbox.looks_like_order_email('Delivered: "Widget Pro" and 2 more items'))
         self.assertTrue(parse_mbox.looks_like_order_email('Out for delivery: "Widget Pro"'))
         self.assertFalse(parse_mbox.looks_like_order_email("Unsubscribe confirmation"))
@@ -632,6 +633,157 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(rows[0]["current_status"], "Delivered")
         self.assertIn("addressable", rows[0]["item_name_normalized"])
         self.assertEqual(rows[0]["num_contributing_emails"], 2)
+
+    def test_amazon_line_item_merges_same_order_prefix_key_variants(self):
+        emails = [
+            {
+                "message_id": "<short-power@example>",
+                "sender_email": "shipment-tracking@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Shipped: "Amazon Basics PC Power Cord..."',
+                "date": "Tue, 24 Jun 2026 10:00:00 -0700",
+                "body_text": "Order # 114-1816216-0000000\n* Amazon Basics PC Power Cord 3 Quantity: 1",
+            },
+            {
+                "message_id": "<long-power@example>",
+                "sender_email": "shipment-tracking@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Delivered: "Amazon Basics PC Power Cable..."',
+                "date": "Wed, 25 Jun 2026 10:00:00 -0700",
+                "body_text": "Order # 114-1816216-0000000\n* Amazon Basics PC Power Cable 6 Quantity: 1",
+            },
+        ]
+
+        rows = analyze.amazon_line_item_rows(analyze.update_amazon_line_item_state(emails, {}))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["current_status"], "Delivered")
+        self.assertEqual(rows[0]["num_contributing_emails"], 2)
+
+    def test_amazon_line_item_merges_same_order_spec_subset_variants(self):
+        emails = [
+            {
+                "message_id": "<short-edge@example>",
+                "sender_email": "shipment-tracking@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Shipped: "Edge Supply Birch..."',
+                "date": "Tue, 24 Jun 2026 10:00:00 -0700",
+                "body_text": 'Order # 114-0777813-0000000\n* Edge Supply Birch 5/8" Quantity: 1',
+            },
+            {
+                "message_id": "<long-edge@example>",
+                "sender_email": "shipment-tracking@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Delivered: "Edge Supply Birch..."',
+                "date": "Wed, 25 Jun 2026 10:00:00 -0700",
+                "body_text": 'Order # 114-0777813-0000000\n* Edge Supply Birch x 25 Roll 5/8" Quantity: 1',
+            },
+        ]
+
+        rows = analyze.amazon_line_item_rows(analyze.update_amazon_line_item_state(emails, {}))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["current_status"], "Delivered")
+        self.assertIn('5/8"', rows[0]["item_name_normalized"])
+
+    def test_amazon_line_item_assigns_multi_order_manifest_blocks_to_nearest_order(self):
+        emails = [
+            {
+                "message_id": "<multi-order@example>",
+                "sender_email": "shipment-tracking@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Ordered: 5 "USBGear..." and 34 more items',
+                "date": "Tue, 26 May 2026 01:00:33 +0000",
+                "body_text": (
+                    "Order # 111-1111111-1111111\n"
+                    "* Facmogu DC 12V Adapter Quantity: 10\n"
+                    "* WAGO 221 Lever Nuts Quantity: 1\n"
+                    "Grand Total: $100.00\n"
+                    "Order # 222-2222222-2222222\n"
+                    "* MECCANIXITY M5 Thumb Screws Quantity: 4\n"
+                    "Grand Total: $20.00\n"
+                    "Order # 114-2441697-7949852\n"
+                    "* USBGear 10-Port USB Hub 3.2 Quantity: 5\n"
+                    "* ALITOVE 100pcs WS2812B LED Strip 5V Quantity: 1\n"
+                ),
+            }
+        ]
+
+        rows = analyze.amazon_line_item_rows(analyze.update_amazon_line_item_state(emails, {}))
+        target_rows = [row for row in rows if row["order_number"] == "114-2441697-7949852"]
+
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(target_rows), 2)
+        self.assertTrue(all("facmogu" not in row["item_name_normalized"] for row in target_rows))
+
+    def test_amazon_line_item_prefers_order_id_url_markers_for_block_assignment(self):
+        emails = [
+            {
+                "message_id": "<multi-order-url@example>",
+                "sender_email": "shipment-tracking@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Ordered: 2 "Mixed order..."',
+                "date": "Tue, 26 May 2026 01:00:33 +0000",
+                "body_text": (
+                    "Order # 999-9999999-9999999\n"
+                    "https://www.amazon.com/your-orders/order-details?orderID=111-1111111-1111111&ref_=x\n"
+                    "* Facmogu DC 12V Adapter Quantity: 10\n"
+                    "https://www.amazon.com/your-orders/order-details?orderID=222-2222222-2222222&ref_=x\n"
+                    "* WAGO 221 Lever Nuts Quantity: 1\n"
+                ),
+            }
+        ]
+
+        rows = analyze.amazon_line_item_rows(analyze.update_amazon_line_item_state(emails, {}))
+
+        self.assertEqual({row["order_number"] for row in rows}, {"111-1111111-1111111", "222-2222222-2222222"})
+        self.assertEqual(next(row for row in rows if "facmogu" in row["item_name_normalized"])["order_number"], "111-1111111-1111111")
+        self.assertEqual(next(row for row in rows if "wago" in row["item_name_normalized"])["order_number"], "222-2222222-2222222")
+
+    def test_amazon_subject_fallback_skipped_for_multi_order_confirmation(self):
+        emails = [
+            {
+                "message_id": "<multi-order-noblocks@example>",
+                "sender_email": "auto-confirm@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Your Amazon.com order of "Edge Supply Birch 5/8 X..." and 1 more item.',
+                "date": "Tue, 26 May 2026 01:00:33 +0000",
+                "body_text": (
+                    "Hello, Thank you for your order. "
+                    "Order # 114-0807316-0777813 "
+                    "https://www.amazon.com/your-orders/order-details?orderID=114-0807316-0777813&ref_=x "
+                    "Order # 114-0959342-5149854 "
+                    "https://www.amazon.com/your-orders/order-details?orderID=114-0959342-5149854&ref_=x "
+                    "Your order will arrive soon."
+                ),
+            }
+        ]
+
+        rows = analyze.amazon_line_item_rows(analyze.update_amazon_line_item_state(emails, {}))
+
+        self.assertEqual(rows, [])
+
+    def test_amazon_subject_fallback_used_for_single_order_confirmation(self):
+        emails = [
+            {
+                "message_id": "<single-order-noblocks@example>",
+                "sender_email": "auto-confirm@amazon.com",
+                "sender_name": "Amazon",
+                "subject": 'Your Amazon.com order of "Tan QY USB 3.0 Cable A Male...".',
+                "date": "Tue, 26 May 2026 01:00:33 +0000",
+                "body_text": (
+                    "Hello, Thank you for your order. "
+                    "Order # 114-9841725-6704204 "
+                    "https://www.amazon.com/your-orders/order-details?orderID=114-9841725-6704204&ref_=x "
+                    "Your order will arrive soon."
+                ),
+            }
+        ]
+
+        rows = analyze.amazon_line_item_rows(analyze.update_amazon_line_item_state(emails, {}))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["order_number"], "114-9841725-6704204")
 
     def test_amazon_line_item_csv_contains_requested_columns(self):
         with tempfile.TemporaryDirectory() as tmpdir:

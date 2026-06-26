@@ -272,6 +272,23 @@ def extractAmazonItemBlocksFromBody(body: str | None) -> list[dict[str, Any]]:
     return blocks
 
 
+def extractAmazonItemBlocksWithPositionsFromBody(body: str | None) -> list[dict[str, Any]]:
+    normalized = normalize_body(body)
+    blocks = []
+    for match in re.finditer(r"(?:^|\s)\*\s+(.+?)\s+(?:Quantity|Qty)\s*:\s*(\d+)\b", normalized, re.I):
+        candidate = clean_item_candidate(match.group(1))
+        if not candidate or is_ui_button_phrase(candidate) or is_sku_only_candidate(candidate):
+            continue
+        blocks.append(
+            {
+                "item_name": candidate,
+                "quantity": int(match.group(2)),
+                "position": match.start(),
+            }
+        )
+    return blocks
+
+
 def extract_item_name(body: str, domain: str) -> str:
     del domain
     normalized = normalize_body(body)

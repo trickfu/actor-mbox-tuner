@@ -53,11 +53,11 @@ The legacy inventory CSV still collapses duplicate emails by `order_number` for 
 
 `analyze.py` performs the inventory boundary before running detailed extraction. `classifyEmailCategory()` uses sender, subject, and body text to route each parsed message to `inventory`, `food`, or `ignore`; only inventory messages become CSV rows. Food delivery senders and DoorDash-style food order subjects are excluded before item, total, and arrival extraction runs.
 
-`extract.py` owns field extraction. For Amazon, body bullet quantity blocks like `* <item name> Quantity: <n>` are the primary line-item source; when those blocks are absent, older quoted Amazon order/shipping subjects are used as a narrow fallback. Generic item extraction rejects UI button text and SKU-only labels such as `Item no.: 8105207`.
+`extract.py` owns field extraction. For Amazon, body bullet quantity blocks like `* <item name> Quantity: <n>` are the primary line-item source; when those blocks are absent, older quoted Amazon order/shipping subjects are used as a narrow fallback. Large Amazon emails may contain multiple order sections, so line-item blocks are assigned to the nearest preceding `orderID=` URL marker, falling back to visible `Order #` sections only when URL markers are absent. The subject-line fallback is only used when the body references a single order; for multi-order confirmation emails with no positioned blocks the subject item is skipped rather than guessed onto one order, which prevents phantom cross-order line items. Generic item extraction rejects UI button text and SKU-only labels such as `Item no.: 8105207`.
 
 `normalizeItemName()` preserves identifying size/spec tokens such as `M2.5`, `16mm`, `12V`, `200W`, `1/2"`, `100pcs`, and pack counts after removing configurable marketing filler words.
 
-`analyze.py` maintains a persistent Amazon line-item state record for each `order_number + item_name_normalized`. Each record tracks quantity, current status, ordered/shipped/delivered dates, contributing message IDs, payment/shipping flags, and `added_to_inventory`. Status only advances (`Ordered` -> `Shipped` -> `Out for delivery` -> `Delivered`) and delivered line items are marked inventory-ready once.
+`analyze.py` maintains a persistent Amazon line-item state record for each `order_number + item_name_normalized`. Each record tracks quantity, current status, ordered/shipped/delivered dates, contributing message IDs, payment/shipping flags, and `added_to_inventory`. Status only advances (`Ordered` -> `Shipped` -> `Out for delivery` -> `Delivered`) and delivered line items are marked inventory-ready once. ASIN keying is only safe if ASINs are present in the parsed Amazon bodies; when they are absent, same-order normalized-name variants are merged conservatively using subset, high-overlap, and stable-prefix token matching.
 
 ## Iteration Loop
 
@@ -85,6 +85,14 @@ python3 analyze.py --similar-items
 ```
 
 This prints clusters from `findSimilarItems()` using token overlap on `item_name_normalized`. It is a review report only; it does not merge or deduplicate rows.
+
+To audit cross-order attribution, run:
+
+```bash
+python3 analyze.py --attribution-audit
+```
+
+This recomputes nearest-preceding-`orderID` attribution per body item block and prints every item attributed to two or more orders, marking each attribution `true` (backed by a real preceding `orderID=` marker) or `PHANTOM` (only a fallback). A healthy run reports `Total phantom attributions: 0`.
 
 ## Files
 

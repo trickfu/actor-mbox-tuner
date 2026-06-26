@@ -147,29 +147,65 @@ def line_item_key(order_number: str, normalized_item_name: str) -> str:
     return f"{order_number}::{normalized_item_name}"
 
 
+TOKEN_SYNONYMS = {"cable": "cord", "wire": "cord"}
+
+
+def canonical_match_tokens(normalized_item_name: str) -> list[str]:
+    tokens = []
+    for token in normalized_item_name.split():
+        canonical = TOKEN_SYNONYMS.get(token, token)
+        if re.fullmatch(r"\d+/\d+\"?", canonical):
+            canonical = canonical.rstrip('"')
+        tokens.append(canonical)
+    return tokens
+
+
+def jaccard_for_tokens(left_tokens: set[str], right_tokens: set[str]) -> float:
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def should_merge_same_order_items(existing_normalized: str, new_normalized: str) -> bool:
+    existing_tokens = canonical_match_tokens(existing_normalized)
+    new_tokens = canonical_match_tokens(new_normalized)
+    if len(existing_tokens) < 2 or len(new_tokens) < 2:
+        return False
+
+    existing_set = set(existing_tokens)
+    new_set = set(new_tokens)
+    if existing_set <= new_set or new_set <= existing_set:
+        return True
+    if jaccard_for_tokens(existing_set, new_set) >= 0.8:
+        return True
+
+    prefix_len = min(4, len(existing_tokens), len(new_tokens))
+    if prefix_len >= 4 and existing_tokens[:prefix_len] == new_tokens[:prefix_len]:
+        return True
+    return False
+
+
 def matching_line_item_key(
     state: dict[str, dict[str, Any]],
     order_number: str,
     normalized_item_name: str,
 ) -> str:
-    new_tokens = set(normalized_item_name.split())
-    if len(new_tokens) < 2:
+    if len(normalized_item_name.split()) < 2:
         return line_item_key(order_number, normalized_item_name)
 
     for existing_key, record in list(state.items()):
         if record.get("order_number") != order_number:
             continue
         existing_normalized = record.get("item_name_normalized", "")
-        existing_tokens = set(existing_normalized.split())
-        if len(existing_tokens) < 2:
+        if not should_merge_same_order_items(existing_normalized, normalized_item_name):
             continue
-        if existing_tokens <= new_tokens or new_tokens <= existing_tokens:
-            if len(new_tokens) > len(existing_tokens):
-                new_key = line_item_key(order_number, normalized_item_name)
-                state[new_key] = state.pop(existing_key)
-                state[new_key]["item_name_normalized"] = normalized_item_name
-                return new_key
-            return existing_key
+
+        if len(normalized_item_name.split()) > len(existing_normalized.split()):
+            new_key = line_item_key(order_number, normalized_item_name)
+            state[new_key] = state.pop(existing_key)
+            state[new_key]["item_name_normalized"] = normalized_item_name
+            return new_key
+        return existing_key
 
     return line_item_key(order_number, normalized_item_name)
 
@@ -226,6 +262,80 @@ def max_iso_date(left: str, right: str) -> str:
     return max(left, right)
 
 
+def amazon_order_markers(normalized_body: str) -> list[re.Match[str]]:
+    markers = list(re.finditer(r"\borderID=([0-9]{3}-[0-9]{7}-[0-9]{7})\b", normalized_body, re.I))
+    if not markers:
+        markers = list(re.finditer(r"\border\s*#\s*([0-9]{3}-[0-9]{7}-[0-9]{7})\b", normalized_body, re.I))
+    return markers
+
+
+def amazon_item_blocks_by_order(body: str | None, fallback_order_number: str) -> list[dict[str, Any]]:
+    normalized_body = extract.normalize_body(body)
+    order_matches = amazon_order_markers(normalized_body)
+    item_blocks = extract.extractAmazonItemBlocksWithPositionsFromBody(normalized_body)
+    if not order_matches:
+        return [{**block, "order_number": fallback_order_number} for block in item_blocks]
+
+    assigned_blocks = []
+    for block in item_blocks:
+        preceding_orders = [match for match in order_matches if match.start() <= block["position"]]
+        order_number = preceding_orders[-1].group(1) if preceding_orders else fallback_order_number
+        assigned_blocks.append({**block, "order_number": order_number})
+    return assigned_blocks
+
+
+def cross_order_attribution_audit(emails: list[dict[str, Any]]) -> dict[str, dict[str, bool]]:
+    """Recompute nearest-preceding-orderID attribution per item block.
+
+    Returns normalized_item_name -> {order_number: backed_by_real_marker}. An
+    attribution is "real" when the block has a preceding orderID= URL marker;
+    otherwise it is a fallback ("phantom") attribution.
+    """
+    attribution: dict[str, dict[str, bool]] = defaultdict(dict)
+    for email_obj in emails:
+        if extract.get_domain(email_obj.get("sender_email", "")) != "amazon.com":
+            continue
+        normalized_body = extract.normalize_body(email_obj.get("body_text", ""))
+        fallback_order = extract.extract_order_number(email_obj.get("body_text", ""), "amazon.com")
+        if not is_hit(fallback_order):
+            fallback_order = extract.extract_order_number(
+                f"{email_obj.get('subject', '')} {email_obj.get('body_text', '')}",
+                "amazon.com",
+            )
+        markers = amazon_order_markers(normalized_body)
+        for block in extract.extractAmazonItemBlocksWithPositionsFromBody(normalized_body):
+            normalized = extract.normalizeItemName(block["item_name"])["cleaned"]
+            if not normalized:
+                continue
+            preceding = [match for match in markers if match.start() <= block["position"]]
+            if preceding:
+                order_number, is_real = preceding[-1].group(1), True
+            elif is_hit(fallback_order):
+                order_number, is_real = fallback_order, False
+            else:
+                continue
+            attribution[normalized][order_number] = attribution[normalized].get(order_number, False) or is_real
+    return attribution
+
+
+def print_cross_order_attribution_audit(emails: list[dict[str, Any]]) -> int:
+    attribution = cross_order_attribution_audit(emails)
+    multi_order = {name: orders for name, orders in attribution.items() if len(orders) >= 2}
+    phantom_total = 0
+    print("Cross-order attribution audit (items under 2+ orders):")
+    if not multi_order:
+        print("No item is attributed to more than one order.")
+        return 0
+    for name in sorted(multi_order):
+        print(f"\n{name}")
+        for order_number in sorted(multi_order[name]):
+            backed = multi_order[name][order_number]
+            phantom_total += 0 if backed else 1
+            print(f"    {order_number}: {'true' if backed else 'PHANTOM'}")
+    print(f"\nTotal phantom attributions: {phantom_total}")
+    return phantom_total
+
+
 def update_amazon_line_item_state(
     emails: list[dict[str, Any]],
     existing_state: dict[str, dict[str, Any]] | None = None,
@@ -244,11 +354,13 @@ def update_amazon_line_item_state(
         if not is_hit(order_number):
             continue
 
-        item_blocks = extract.extractAmazonItemBlocksFromBody(body)
+        item_blocks = amazon_item_blocks_by_order(body, order_number)
         if not item_blocks:
-            subject_item = extract.extractItemNameFromSubject(email_obj.get("subject", ""))
-            if subject_item:
-                item_blocks = [{"item_name": subject_item["itemName"], "quantity": 1}]
+            distinct_body_orders = {match.group(1) for match in amazon_order_markers(extract.normalize_body(body))}
+            if len(distinct_body_orders) <= 1:
+                subject_item = extract.extractItemNameFromSubject(email_obj.get("subject", ""))
+                if subject_item:
+                    item_blocks = [{"item_name": subject_item["itemName"], "quantity": 1, "order_number": order_number}]
         flags = amazon_line_item_flags(email_obj.get("subject", ""))
         status = amazon_line_item_status(email_obj.get("subject", ""))
         parsed_email_date = extract.parse_email_date(email_obj.get("date", ""))
@@ -266,14 +378,15 @@ def update_amazon_line_item_state(
             continue
 
         for item_block in item_blocks:
+            item_order_number = item_block.get("order_number") or order_number
             normalized = extract.normalizeItemName(item_block["item_name"])["cleaned"]
             if not normalized:
                 continue
-            key = matching_line_item_key(state, order_number, normalized)
+            key = matching_line_item_key(state, item_order_number, normalized)
             record = state.setdefault(
                 key,
                 default_line_item_record(
-                    order_number,
+                    item_order_number,
                     item_block["item_name"],
                     normalized,
                     item_block["quantity"],
@@ -640,9 +753,29 @@ def main() -> None:
         action="store_true",
         help="Print cross-domain item similarity clusters after writing the CSV",
     )
+    parser.add_argument(
+        "--attribution-audit",
+        action="store_true",
+        help="Print per-item cross-order attribution audit (true vs phantom)",
+    )
     args = parser.parse_args()
 
     rows = analyze_file(args.input, args.csv)
+    if args.attribution_audit:
+        print()
+        emails = json.loads(Path(args.input).read_text(encoding="utf-8"))
+        inventory_emails = [
+            email_obj
+            for email_obj in emails
+            if classifyEmailCategory(
+                email_obj.get("sender_email", ""),
+                email_obj.get("sender_name", ""),
+                email_obj.get("subject", ""),
+                email_obj.get("body_text", ""),
+            )
+            == "inventory"
+        ]
+        print_cross_order_attribution_audit(inventory_emails)
     if args.similar_items:
         print()
         findSimilarItems(rows)

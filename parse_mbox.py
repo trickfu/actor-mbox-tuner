@@ -16,7 +16,7 @@ from typing import Iterable
 
 
 ORDER_SUBJECT_RE = re.compile(
-    r"\b(order|receipt|confirmation|shipped|shipping|delivered|delivery|arriving)\b",
+    r"\b(order|ordered|receipt|confirmation|shipped|shipping|delivered|delivery|arriving)\b",
     re.I,
 )
 EXCLUDE_SUBJECT_RE = re.compile(
